@@ -8,8 +8,8 @@
 // carries its own Settings and Branding.
 //
 // The plugin owns its data through a small Store interface (a bounded in-memory
-// store by default; back it with a database later) and exposes a Go API plus a
-// REST surface under /api/orgs. It composes with `auth` but works standalone.
+// store by default; back it with a database via WithStore) and exposes a Go API
+// plus a REST surface under /api/orgs. It composes with `auth` but works standalone.
 package authplatform
 
 import (
@@ -84,20 +84,39 @@ type Invite struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Service is the auth-platform runtime stored on the kernel (k.Get("auth-platform")).
-type Service struct {
-	mu      sync.RWMutex
-	orgs    map[string]*Org
-	members map[string]map[string]*Member // orgID -> userID -> member
-	invites map[string]*Invite            // token -> invite
+// Store is the persistence seam. The default is a bounded in-memory store;
+// install a DB-backed implementation with Service.WithStore. The Service always
+// persists mutations via an explicit Save*, so a DB store never needs to track
+// in-place changes to returned structs.
+type Store interface {
+	SaveOrg(o *Org)
+	GetOrg(id string) (*Org, bool)
+	OrgBySlug(slug string) (*Org, bool)
+	AllOrgs() []*Org
+	DeleteOrg(id string)
+
+	SaveMember(m *Member)
+	GetMember(orgID, userID string) (*Member, bool)
+	MembersByOrg(orgID string) []*Member
+	RemoveMember(orgID, userID string)
+	OrgsForUser(userID string) []*Org
+
+	SaveInvite(inv *Invite)
+	GetInvite(tokenStr string) (*Invite, bool)
+	DeleteInvite(tokenStr string)
 }
 
-func newService() *Service {
-	return &Service{
-		orgs:    map[string]*Org{},
-		members: map[string]map[string]*Member{},
-		invites: map[string]*Invite{},
-	}
+// Service is the auth-platform runtime stored on the kernel (k.Get("auth-platform")).
+type Service struct {
+	store Store
+}
+
+func newService() *Service { return &Service{store: newMemStore()} }
+
+// WithStore swaps the backing store (e.g. a DB-backed implementation).
+func (s *Service) WithStore(store Store) *Service {
+	s.store = store
+	return s
 }
 
 func init() {
@@ -153,8 +172,6 @@ func (s *Service) CreateOrg(name, slug, ownerID string) (*Org, error) {
 	if slug == "" {
 		slug = slugify(name)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	org := &Org{
 		ID:        token()[:16],
 		Name:      name,
@@ -164,133 +181,90 @@ func (s *Service) CreateOrg(name, slug, ownerID string) (*Org, error) {
 		Settings:  map[string]any{},
 		CreatedAt: time.Now().UTC(),
 	}
-	s.orgs[org.ID] = org
-	s.members[org.ID] = map[string]*Member{
-		ownerID: {OrgID: org.ID, UserID: ownerID, Role: RoleOwner, Status: StatusActive, JoinedAt: org.CreatedAt},
-	}
+	s.store.SaveOrg(org)
+	s.store.SaveMember(&Member{OrgID: org.ID, UserID: ownerID, Role: RoleOwner, Status: StatusActive, JoinedAt: org.CreatedAt})
 	return org, nil
 }
 
 // GetOrg returns an org by id.
-func (s *Service) GetOrg(id string) (*Org, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	o, ok := s.orgs[id]
-	return o, ok
-}
+func (s *Service) GetOrg(id string) (*Org, bool) { return s.store.GetOrg(id) }
 
 // OrgBySlug returns an org by slug.
-func (s *Service) OrgBySlug(slug string) (*Org, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, o := range s.orgs {
-		if o.Slug == slug {
-			return o, true
-		}
-	}
-	return nil, false
+func (s *Service) OrgBySlug(slug string) (*Org, bool) { return s.store.OrgBySlug(slug) }
+
+// AllOrgs lists every org (admin view).
+func (s *Service) AllOrgs() []*Org {
+	out := s.store.AllOrgs()
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
 }
 
 // DeleteOrg removes an org and its memberships.
-func (s *Service) DeleteOrg(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.orgs, id)
-	delete(s.members, id)
-}
+func (s *Service) DeleteOrg(id string) { s.store.DeleteOrg(id) }
 
 // Invite creates a pending invitation and returns its token.
 func (s *Service) Invite(orgID, email, role string) (*Invite, error) {
 	if role == "" {
 		role = RoleMember
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.orgs[orgID]; !ok {
+	if _, ok := s.store.GetOrg(orgID); !ok {
 		return nil, ErrNotFound
 	}
 	inv := &Invite{Token: token(), OrgID: orgID, Email: strings.ToLower(email), Role: role, CreatedAt: time.Now().UTC()}
-	s.invites[inv.Token] = inv
+	s.store.SaveInvite(inv)
 	return inv, nil
 }
 
 // Accept consumes an invite token and adds the user as an active member.
 func (s *Service) Accept(inviteToken, userID string) (*Member, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	inv, ok := s.invites[inviteToken]
+	inv, ok := s.store.GetInvite(inviteToken)
 	if !ok {
 		return nil, ErrInviteUsed
 	}
-	delete(s.invites, inviteToken)
-	if _, ok := s.orgs[inv.OrgID]; !ok {
+	s.store.DeleteInvite(inviteToken)
+	if _, ok := s.store.GetOrg(inv.OrgID); !ok {
 		return nil, ErrNotFound
 	}
 	m := &Member{OrgID: inv.OrgID, UserID: userID, Role: inv.Role, Status: StatusActive, JoinedAt: time.Now().UTC()}
-	if s.members[inv.OrgID] == nil {
-		s.members[inv.OrgID] = map[string]*Member{}
-	}
-	s.members[inv.OrgID][userID] = m
+	s.store.SaveMember(m)
 	return m, nil
 }
 
 // AddMember directly adds (or updates) a member.
 func (s *Service) AddMember(orgID, userID, role string) (*Member, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.orgs[orgID]; !ok {
+	if _, ok := s.store.GetOrg(orgID); !ok {
 		return nil, ErrNotFound
 	}
-	if s.members[orgID] == nil {
-		s.members[orgID] = map[string]*Member{}
-	}
 	m := &Member{OrgID: orgID, UserID: userID, Role: role, Status: StatusActive, JoinedAt: time.Now().UTC()}
-	s.members[orgID][userID] = m
+	s.store.SaveMember(m)
 	return m, nil
 }
 
 // RemoveMember removes a member from an org.
-func (s *Service) RemoveMember(orgID, userID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if mm := s.members[orgID]; mm != nil {
-		delete(mm, userID)
-	}
-}
+func (s *Service) RemoveMember(orgID, userID string) { s.store.RemoveMember(orgID, userID) }
 
 // SetRole changes a member's role.
 func (s *Service) SetRole(orgID, userID, role string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	mm := s.members[orgID]
-	if mm == nil || mm[userID] == nil {
+	m, ok := s.store.GetMember(orgID, userID)
+	if !ok {
 		return ErrNotFound
 	}
-	mm[userID].Role = role
+	m.Role = role
+	s.store.SaveMember(m)
 	return nil
 }
 
 // Members lists an org's members.
 func (s *Service) Members(orgID string) []*Member {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	mm := s.members[orgID]
-	out := make([]*Member, 0, len(mm))
-	for _, m := range mm {
-		out = append(out, m)
-	}
+	out := s.store.MembersByOrg(orgID)
 	sort.Slice(out, func(i, j int) bool { return out[i].JoinedAt.Before(out[j].JoinedAt) })
 	return out
 }
 
 // MemberRole returns a user's role in an org (and whether they're a member).
 func (s *Service) MemberRole(orgID, userID string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if mm := s.members[orgID]; mm != nil {
-		if m := mm[userID]; m != nil {
-			return m.Role, true
-		}
+	if m, ok := s.store.GetMember(orgID, userID); ok {
+		return m.Role, true
 	}
 	return "", false
 }
@@ -312,25 +286,14 @@ func (s *Service) HasRole(orgID, userID, role string) bool {
 
 // OrgsForUser lists every org a user belongs to (the org switcher feed).
 func (s *Service) OrgsForUser(userID string) []*Org {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var out []*Org
-	for orgID, mm := range s.members {
-		if mm[userID] != nil {
-			if o := s.orgs[orgID]; o != nil {
-				out = append(out, o)
-			}
-		}
-	}
+	out := s.store.OrgsForUser(userID)
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
 }
 
 // SetSetting sets a per-org setting.
 func (s *Service) SetSetting(orgID, key string, value any) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	o, ok := s.orgs[orgID]
+	o, ok := s.store.GetOrg(orgID)
 	if !ok {
 		return ErrNotFound
 	}
@@ -338,14 +301,13 @@ func (s *Service) SetSetting(orgID, key string, value any) error {
 		o.Settings = map[string]any{}
 	}
 	o.Settings[key] = value
+	s.store.SaveOrg(o)
 	return nil
 }
 
 // Setting reads a per-org setting.
 func (s *Service) Setting(orgID, key string) (any, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if o, ok := s.orgs[orgID]; ok {
+	if o, ok := s.store.GetOrg(orgID); ok {
 		v, ok := o.Settings[key]
 		return v, ok
 	}
@@ -354,14 +316,143 @@ func (s *Service) Setting(orgID, key string) (any, bool) {
 
 // SetBranding updates an org's branding.
 func (s *Service) SetBranding(orgID string, b Branding) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	o, ok := s.orgs[orgID]
+	o, ok := s.store.GetOrg(orgID)
 	if !ok {
 		return ErrNotFound
 	}
 	o.Branding = b
+	s.store.SaveOrg(o)
 	return nil
+}
+
+// ── in-memory store (default) ──
+
+type memStore struct {
+	mu      sync.RWMutex
+	orgs    map[string]*Org
+	members map[string]map[string]*Member // orgID -> userID -> member
+	invites map[string]*Invite            // token -> invite
+}
+
+func newMemStore() *memStore {
+	return &memStore{
+		orgs:    map[string]*Org{},
+		members: map[string]map[string]*Member{},
+		invites: map[string]*Invite{},
+	}
+}
+
+func (m *memStore) SaveOrg(o *Org) {
+	m.mu.Lock()
+	m.orgs[o.ID] = o
+	m.mu.Unlock()
+}
+
+func (m *memStore) GetOrg(id string) (*Org, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	o, ok := m.orgs[id]
+	return o, ok
+}
+
+func (m *memStore) OrgBySlug(slug string) (*Org, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, o := range m.orgs {
+		if o.Slug == slug {
+			return o, true
+		}
+	}
+	return nil, false
+}
+
+func (m *memStore) AllOrgs() []*Org {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Org, 0, len(m.orgs))
+	for _, o := range m.orgs {
+		out = append(out, o)
+	}
+	return out
+}
+
+func (m *memStore) DeleteOrg(id string) {
+	m.mu.Lock()
+	delete(m.orgs, id)
+	delete(m.members, id)
+	m.mu.Unlock()
+}
+
+func (m *memStore) SaveMember(mem *Member) {
+	m.mu.Lock()
+	if m.members[mem.OrgID] == nil {
+		m.members[mem.OrgID] = map[string]*Member{}
+	}
+	m.members[mem.OrgID][mem.UserID] = mem
+	m.mu.Unlock()
+}
+
+func (m *memStore) GetMember(orgID, userID string) (*Member, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if mm := m.members[orgID]; mm != nil {
+		if mem := mm[userID]; mem != nil {
+			return mem, true
+		}
+	}
+	return nil, false
+}
+
+func (m *memStore) MembersByOrg(orgID string) []*Member {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	mm := m.members[orgID]
+	out := make([]*Member, 0, len(mm))
+	for _, mem := range mm {
+		out = append(out, mem)
+	}
+	return out
+}
+
+func (m *memStore) RemoveMember(orgID, userID string) {
+	m.mu.Lock()
+	if mm := m.members[orgID]; mm != nil {
+		delete(mm, userID)
+	}
+	m.mu.Unlock()
+}
+
+func (m *memStore) OrgsForUser(userID string) []*Org {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*Org
+	for orgID, mm := range m.members {
+		if mm[userID] != nil {
+			if o := m.orgs[orgID]; o != nil {
+				out = append(out, o)
+			}
+		}
+	}
+	return out
+}
+
+func (m *memStore) SaveInvite(inv *Invite) {
+	m.mu.Lock()
+	m.invites[inv.Token] = inv
+	m.mu.Unlock()
+}
+
+func (m *memStore) GetInvite(tokenStr string) (*Invite, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	inv, ok := m.invites[tokenStr]
+	return inv, ok
+}
+
+func (m *memStore) DeleteInvite(tokenStr string) {
+	m.mu.Lock()
+	delete(m.invites, tokenStr)
+	m.mu.Unlock()
 }
 
 // ── request context ──
