@@ -101,7 +101,7 @@ func newService() *Service {
 }
 
 func init() {
-	togo.RegisterProviderFunc("auth-platform", togo.PriorityService, func(k *togo.Kernel) error {
+	togo.RegisterProviderFunc("auth-platform", togo.PriorityLate+10, func(k *togo.Kernel) error {
 		s := newService()
 		k.Set("auth-platform", s)
 		if k.Router != nil {
